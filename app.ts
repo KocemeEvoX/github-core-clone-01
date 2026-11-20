@@ -172,40 +172,60 @@ function writePack(objects: GitObject[]): Buffer {
   return Buffer.concat([body, sha1Hex(body)]);
 }
 
-/** Locate the end of a zlib stream starting at `start` by binary search on inflateSync. */
+/** Adler-32 checksum, the way the zlib format stores it (big-endian, mod 65521). */
+function adler32(data: Buffer): number {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  let i = 0;
+  while (i < data.length) {
+    // Defer the modulo: a and b stay exact for up to 5552 bytes at a time.
+    const chunk = Math.min(data.length - i, 5552);
+    for (let j = 0; j < chunk; j += 1) {
+      a += data[i];
+      b += a;
+      i += 1;
+    }
+    a %= MOD;
+    b %= MOD;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * Inflate the zlib stream starting at `start`, and locate its end without
+ * re-inflating. inflateSync ignores trailing bytes, so one call yields the
+ * object; the stream's last four bytes are the Adler-32 of the decompressed
+ * data, and scanning for those bytes finds the end. (A match inside the
+ * compressed data is a 1-in-2^32 coincidence per position; when the scan
+ * finds more than one match, each candidate is verified by re-inflating
+ * the exact slice.)
+ */
 function inflateAt(buf: Buffer, start: number, wantSize: number): { data: Buffer; end: number } {
-  let lo = start;
-  let hi = buf.length;
-  // First find any working end by exponential probe, then binary search.
-  let probe = start + 1;
-  let found = -1;
-  while (probe <= buf.length) {
-    try {
-      const out = zlib.inflateSync(buf.subarray(start, probe));
-      if (out.length === wantSize) {
-        found = probe;
-        break;
-      }
-    } catch {
-      // truncated: need more bytes
-    }
-    if (probe >= buf.length) break;
-    probe = Math.min(buf.length, start + (probe - start) * 2);
+  const data = zlib.inflateSync(buf.subarray(start));
+  if (data.length !== wantSize) throw new Error('zlib stream size mismatch');
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler32(data), 0);
+  const matches: number[] = [];
+  let from = start;
+  for (;;) {
+    const idx = buf.indexOf(needle, from);
+    if (idx < 0) break;
+    matches.push(idx + 4);
+    from = idx + 1;
+    if (matches.length > 8) break;
   }
-  if (found < 0) throw new Error('zlib stream not found');
-  hi = found;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
+  if (matches.length === 0) throw new Error('zlib stream not found');
+  if (matches.length === 1) return { data, end: matches[0] };
+  for (const end of matches) {
     try {
-      const out = zlib.inflateSync(buf.subarray(start, mid));
-      if (out.length === wantSize) hi = mid;
-      else lo = mid + 1;
+      const check = zlib.inflateSync(buf.subarray(start, end));
+      if (check.length === wantSize && check.equals(data)) return { data, end };
     } catch {
-      lo = mid + 1;
+      // Not this candidate.
     }
   }
-  const data = zlib.inflateSync(buf.subarray(start, lo));
-  return { data, end: lo };
+  throw new Error('zlib stream not found');
 }
 
 interface PackEntry {
